@@ -56,6 +56,9 @@ class TestComponents:
         assert keyword_score("OpenAI releases GPT-5 model", Category.AI) > 0.5
         assert keyword_score("Bitcoin ETF approved by SEC", Category.AI) < 0.3
 
+    def test_hyphenated_keyword_matches_normalized_text(self) -> None:
+        assert keyword_score("OpenAI launches GPT-5 today", Category.AI) == 1.0
+
     def test_keyword_score_crypto(self) -> None:
         assert keyword_score("Bitcoin ETF approved by SEC", Category.CRYPTO) > 0.5
         assert keyword_score("Local coffee shop opens downtown", Category.CRYPTO) == 0.0
@@ -138,6 +141,14 @@ class TestBatch:
 
     def test_score_batch_empty(self, analyzer: TrendAnalyzer) -> None:
         assert analyzer.score_batch([], now=NOW) == []
+
+    def test_unrelated_titles_do_not_inflate_topic_volume(self, analyzer: TrendAnalyzer) -> None:
+        items = [
+            make_item("OpenAI releases a new reasoning model"),
+            make_item("Nvidia opens a new chip factory"),
+        ]
+        scored = analyzer.score_batch(items, now=NOW)
+        assert [components.topic_volume for components in scored] == [0.0, 0.0]
 
     def test_score_record_uses_stored_source_count(self, analyzer: TrendAnalyzer) -> None:
         record = NewsRecord(

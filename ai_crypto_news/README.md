@@ -13,8 +13,8 @@ tính điểm xu hướng và chỉ gửi những tin chưa từng báo.
 - Gom nhiều nguồn đưa cùng một tin vào một bản ghi `news`.
 - Tính trend score theo độ mới, từ khóa, số nguồn và mật độ chủ đề.
 - Gửi Telegram dạng text, retry lỗi mạng và không gửi lại tin đã báo.
-- Scheduler và các lệnh `/latest`, `/ai`, `/crypto`, `/trending`, `/status`,
-  `/crawl`, `/help`.
+- Scheduler hằng ngày có thể bật/tắt và các lệnh `/latest`, `/ai`, `/crypto`,
+  `/trending`, `/status`, `/crawl`, `/auto`, `/help`.
 - Hỗ trợ Chromium để vận hành và Camoufox để nghiên cứu fingerprint.
 
 ## Nguồn Tin
@@ -108,11 +108,60 @@ TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=123456:your-token
 TELEGRAM_CHAT_ID=@your_channel_or_chat_id
 TELEGRAM_ALLOWED_USER_IDS=123456789
-CRAWL_INTERVAL_MINUTES=10
+AUTO_CRAWL_ENABLED=true
+CRAWL_INTERVAL_MINUTES=1440
 ```
 
 `TELEGRAM_ALLOWED_USER_IDS` là danh sách Telegram user ID được phép điều khiển
 bot, phân tách bằng dấu phẩy. Nếu để trống, ứng dụng dùng `TELEGRAM_CHAT_ID`.
+Bot không crawl ngay khi khởi động. Khi tự động đang bật, lần crawl đầu tiên
+diễn ra sau 1440 phút (1 ngày). Trạng thái bật/tắt được lưu trong SQLite nên
+không mất khi restart.
+
+## Lệnh Telegram
+
+| Lệnh | Chức năng |
+| --- | --- |
+| `/start` | Hiển thị lời chào và xác nhận bot đang nhận lệnh. |
+| `/help` | Hiển thị danh sách lệnh ngay trong Telegram. |
+| `/latest` | Đọc 10 tin AI và Crypto mới nhất đang có trong SQLite; không kích hoạt crawl. |
+| `/ai` | Đọc 10 tin AI mới nhất trong SQLite; không kích hoạt crawl. |
+| `/crypto` | Đọc 10 tin Crypto mới nhất trong SQLite; không kích hoạt crawl. |
+| `/trending` | Hiển thị tối đa số tin nổi bật đã cấu hình cho mỗi nhóm trong 24 giờ gần nhất. |
+| `/status` | Xem số lượng tin, lần crawl gần nhất, trạng thái tự động, browser và ngưỡng trend. |
+| `/crawl` | Chạy crawl thủ công ngay lập tức, tính trend, gửi tin mới đạt ngưỡng và báo kết quả. |
+| `/auto status` | Xem crawl tự động đang bật hay tắt và chu kỳ hiện tại. |
+| `/auto on` | Bật crawl tự động; chỉ đặt lịch, không crawl ngay. |
+| `/auto off` | Hủy lịch tự động; `/crawl` thủ công vẫn hoạt động. |
+
+### Hành vi lệnh
+
+- Bot phải đang chạy bằng `python -m app.main serve` thì mới nhận được lệnh.
+- Chỉ user nằm trong `TELEGRAM_ALLOWED_USER_IDS` được điều khiển bot. Với chat
+  cá nhân, nếu biến này để trống thì `TELEGRAM_CHAT_ID` được dùng làm user ID.
+- `/latest`, `/ai`, `/crypto`, `/trending` và `/status` chỉ đọc dữ liệu hiện có,
+  không tạo request tới các website.
+- `/crawl` chạy nền để bot không treo luồng nhận update. Nếu một vòng crawl đang
+  chạy, lệnh `/crawl` tiếp theo sẽ được từ chối.
+- `/auto on` đặt lần chạy đầu tiên sau `CRAWL_INTERVAL_MINUTES`; mặc định là
+  `1440` phút (1 ngày). Restart bot sẽ bắt đầu lại bộ đếm 24 giờ nhưng không
+  crawl ngay.
+- Trạng thái `/auto on` hoặc `/auto off` được lưu trong bảng `app_settings` của
+  SQLite và giữ nguyên sau khi restart.
+- Scheduler chỉ hoạt động khi process bot đang chạy. Khi bot tắt, các mốc lịch
+  bị bỏ qua và không được chạy bù.
+- Tin chỉ được đánh dấu đã gửi sau khi Telegram xác nhận thành công; tin đã gửi
+  hoặc đã chủ động bỏ qua không được gửi lại.
+
+Ví dụ sử dụng:
+
+```text
+/status
+/auto status
+/crawl
+/auto off
+/auto on
+```
 
 Chọn nguồn:
 
@@ -147,7 +196,18 @@ Xem trạng thái database:
 python -m app.main stats
 ```
 
-Chạy Telegram bot và scheduler:
+Khi bật Telegram lần đầu nhưng chỉ muốn gửi tin phát sinh về sau, kiểm tra rồi
+đánh dấu toàn bộ tin hiện có là bỏ qua:
+
+```powershell
+python -m app.main skip-existing --dry-run
+python -m app.main skip-existing
+```
+
+Lệnh này dùng cờ `is_skipped`, không giả các tin cũ là đã gửi Telegram. Thống
+kê `/status` hiển thị riêng số tin đã gửi và số tin đã bỏ qua.
+
+Chạy Telegram bot và scheduler hằng ngày:
 
 ```powershell
 python -m app.main serve
@@ -200,6 +260,7 @@ tin cho mỗi category trong một vòng.
 ## Telegram Delivery
 
 - Tin chỉ được đánh dấu `is_reported=1` sau khi Telegram xác nhận gửi thành công.
+- Tin được bỏ qua chủ động dùng `is_skipped=1` và không được chọn để gửi.
 - Delivery được ghi theo `(news_id, chat_id)` để chống gửi trùng.
 - Lỗi mạng có exponential backoff; lỗi cuối cùng giữ tin ở trạng thái chưa gửi.
 - Nếu message nhiều chunk chỉ gửi được một phần, cả nhóm không bị đánh dấu thành

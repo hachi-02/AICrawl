@@ -34,7 +34,7 @@ logger = get_logger(__name__)
 NEWS_COLUMNS = """
     n.id, n.title, n.url, n.source, n.category, n.author, n.published_at,
     n.summary, n.image_url, n.content_hash, n.canonical_url, n.simhash,
-    n.source_count, n.trend_score, n.is_reported, n.reported_at,
+    n.source_count, n.trend_score, n.is_reported, n.is_skipped, n.reported_at,
     n.telegram_message_id, n.first_seen_at, n.crawled_at
 """
 
@@ -71,6 +71,28 @@ class NewsRepository:
 
     async def close(self) -> None:
         await self.db.close()
+
+    async def get_app_setting(self, key: str) -> str | None:
+        """Đọc một cấu hình runtime bền vững từ SQLite."""
+        value = await self.db.fetch_value(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (key,),
+            default=None,
+        )
+        return str(value) if value is not None else None
+
+    async def set_app_setting(self, key: str, value: str, now: datetime | None = None) -> None:
+        """Ghi cấu hình runtime, tạo mới hoặc cập nhật theo key."""
+        await self.db.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, to_iso(now or utcnow())),
+        )
 
     # ------------------------------------------------------------------
     # Tra cứu nhanh (exact match)
@@ -248,7 +270,7 @@ class NewsRepository:
                 await cursor.execute(
                     """
                     UPDATE news SET published_at = ?
-                    WHERE id = ? AND published_at IS NOT NULL AND ? IS NOT NULL AND ? < published_at
+                    WHERE id = ? AND ? IS NOT NULL AND (published_at IS NULL OR ? < published_at)
                     """,
                     (to_iso(item.published_at), news_id, to_iso(item.published_at), to_iso(item.published_at)),
                 )
@@ -297,7 +319,7 @@ class NewsRepository:
 
     async def is_reported(self, news_id: int) -> bool:
         value = await self.db.fetch_value(
-            "SELECT is_reported FROM news WHERE id = ?",
+            "SELECT (is_reported OR is_skipped) FROM news WHERE id = ?",
             (news_id,),
             default=0,
         )
@@ -320,14 +342,14 @@ class NewsRepository:
             cursor = await connection.cursor()
             try:
                 await cursor.execute(
-                    "SELECT is_reported FROM news WHERE id = ?",
+                    "SELECT is_reported, is_skipped FROM news WHERE id = ?",
                     (news_id,),
                 )
                 row = await cursor.fetchone()
                 if row is None:
                     logger.error("mark_reported: không tìm thấy news id=%s", news_id)
                     return False
-                if bool(row[0]):
+                if bool(row[0]) or bool(row[1]):
                     return False
                 await cursor.execute(
                     """
@@ -352,6 +374,27 @@ class NewsRepository:
             finally:
                 await cursor.close()
         return True
+
+    async def count_unhandled(self) -> int:
+        """Đếm tin chưa gửi và chưa được chủ động bỏ qua."""
+        return int(
+            await self.db.fetch_value(
+                "SELECT COUNT(*) FROM news WHERE is_reported = 0 AND is_skipped = 0",
+                default=0,
+            )
+        )
+
+    async def skip_unhandled(self) -> int:
+        """Đánh dấu toàn bộ tin hiện có là bỏ qua mà không giả là đã gửi."""
+        async with self.db.transaction() as connection:
+            cursor = await connection.cursor()
+            try:
+                await cursor.execute(
+                    "UPDATE news SET is_skipped = 1 WHERE is_reported = 0 AND is_skipped = 0"
+                )
+                return max(0, int(cursor.rowcount))
+            finally:
+                await cursor.close()
 
     async def mark_report_failed(self, news_id: int, chat_id: str, error: str, now: datetime | None = None) -> None:
         """Ghi nhận lần gửi thất bại (không set is_reported để lần sau gửi lại)."""
@@ -412,6 +455,7 @@ class NewsRepository:
         params: list[object] = [category.value, float(min_score), since]
         if only_unreported:
             where.append("n.is_reported = 0")
+            where.append("n.is_skipped = 0")
         params.append(int(limit))
         rows = await self.db.fetch_all(
             f"""
@@ -440,6 +484,7 @@ class NewsRepository:
             params.append(category.value)
         if only_unreported:
             where.append("n.is_reported = 0")
+            where.append("n.is_skipped = 0")
         params.append(int(limit))
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         rows = await self.db.fetch_all(
@@ -451,6 +496,25 @@ class NewsRepository:
             LIMIT ?
             """,
             tuple(params),
+        )
+        return await self._rows_to_records(rows)
+
+    async def select_recent(
+        self,
+        max_age_minutes: int,
+        now: datetime | None = None,
+    ) -> list[NewsRecord]:
+        """Lấy toàn bộ tin trong cửa sổ gần đây để tính lại mật độ chủ đề."""
+        reference = now or utcnow()
+        since = to_iso(reference - timedelta(minutes=max_age_minutes))
+        rows = await self.db.fetch_all(
+            f"""
+            SELECT {NEWS_COLUMNS}
+            FROM news n
+            WHERE COALESCE(n.published_at, n.first_seen_at) >= ?
+            ORDER BY COALESCE(n.published_at, n.first_seen_at) DESC
+            """,
+            (since,),
         )
         return await self._rows_to_records(rows)
 
@@ -469,6 +533,7 @@ class NewsRepository:
             SELECT {NEWS_COLUMNS}
             FROM news n
             WHERE n.is_reported = 0
+              AND n.is_skipped = 0
               AND n.trend_score >= ?
               AND COALESCE(n.published_at, n.first_seen_at) >= ?
             ORDER BY n.trend_score DESC, COALESCE(n.published_at, n.first_seen_at) DESC
@@ -484,6 +549,20 @@ class NewsRepository:
             (news_id,),
         )
         return (await self._rows_to_records([row]))[0] if row else None
+
+    async def get_records(self, news_ids: Sequence[int]) -> list[NewsRecord]:
+        """Lấy nhiều bản tin trong một truy vấn, giữ đúng thứ tự id đầu vào."""
+        ids = [int(news_id) for news_id in news_ids]
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        rows = await self.db.fetch_all(
+            f"SELECT {NEWS_COLUMNS} FROM news n WHERE n.id IN ({placeholders})",  # noqa: S608
+            tuple(ids),
+        )
+        records = await self._rows_to_records(rows)
+        by_id = {record.id: record for record in records}
+        return [by_id[news_id] for news_id in ids if news_id in by_id]
 
     async def list_sources_for(self, news_id: int) -> list[str]:
         rows = await self.db.fetch_all(
@@ -501,6 +580,9 @@ class NewsRepository:
         total = int(await self.db.fetch_value("SELECT COUNT(*) FROM news", default=0))
         reported = int(
             await self.db.fetch_value("SELECT COUNT(*) FROM news WHERE is_reported = 1", default=0)
+        )
+        skipped = int(
+            await self.db.fetch_value("SELECT COUNT(*) FROM news WHERE is_skipped = 1", default=0)
         )
         by_category: dict[str, int] = {}
         for category in Category:
@@ -538,7 +620,8 @@ class NewsRepository:
         return {
             "total": total,
             "reported": reported,
-            "unreported": total - reported,
+            "skipped": skipped,
+            "unreported": total - reported - skipped,
             "by_category": by_category,
             "last_24h": last_24h,
             "source_mentions": source_count,

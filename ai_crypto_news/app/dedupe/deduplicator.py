@@ -67,12 +67,12 @@ class Deduplicator:
         self._by_hash.clear()
         self._token_index.clear()
         self._fingerprints = fingerprints
-        for fingerprint in fingerprints:
+        for position, fingerprint in enumerate(fingerprints):
             if fingerprint.canonical_url:
                 self._by_url.setdefault(fingerprint.canonical_url, fingerprint.news_id)
             if fingerprint.content_hash:
                 self._by_hash.setdefault(fingerprint.content_hash, fingerprint.news_id)
-            self._index_tokens(fingerprint.title_tokens, len(self._fingerprints) - 1)
+            self._index_tokens(fingerprint.title_tokens, position)
         logger.info(
             "Đã nạp index dedup: %d bản tin trong %d ngày",
             len(fingerprints),
@@ -165,6 +165,8 @@ class Deduplicator:
             fingerprint = self._fingerprints[position]
             if not fingerprint.title_tokens:
                 continue
+            if fingerprint.category != item.category.value:
+                continue
 
             same_source = fingerprint.source == item.source
             if same_source:
@@ -248,9 +250,18 @@ class Deduplicator:
         """
         if not inserted:
             return decisions
+        temporary_ids = {
+            id(decision.item): decision.news_id
+            for decision in decisions
+            if decision.kind is MatchKind.NEW
+            and decision.news_id is not None
+            and decision.news_id < 0
+        }
         replacements: dict[int, int] = {}
-        for position, (news_id, item) in enumerate(inserted):
-            replacements[-(position + 1)] = news_id
+        for news_id, item in inserted:
+            temporary_id = temporary_ids.get(id(item))
+            if temporary_id is not None:
+                replacements[temporary_id] = news_id
         resolved: list[DedupDecision] = []
         for decision in decisions:
             news_id = decision.news_id

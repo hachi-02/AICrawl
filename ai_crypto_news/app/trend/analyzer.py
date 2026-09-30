@@ -15,12 +15,17 @@ from __future__ import annotations
 
 import math
 import re
-from collections import Counter
 from datetime import datetime, timedelta
 
 from app.config import Settings
 from app.database.models import Category, NewsItem, NewsRecord, TrendComponents
-from app.dedupe.normalizer import hours_since, normalize_title, utcnow
+from app.dedupe.normalizer import (
+    hours_since,
+    normalize_title,
+    overlap_coefficient,
+    token_set,
+    utcnow,
+)
 from app.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -77,6 +82,7 @@ WEIGHTS: dict[str, float] = {
 
 #: Ngưỡng "số bài coi như chủ đề nóng" để chuẩn hóa topic_volume.
 TOPIC_VOLUME_SATURATION = 8.0
+TOPIC_TITLE_OVERLAP = 0.4
 
 _WORD_RE = re.compile(r"[a-z0-9$]+(?:[.\-][a-z0-9]+)*")
 
@@ -91,11 +97,12 @@ def keyword_score(text: str, category: Category) -> float:
     table = KEYWORDS.get(category, {})
     hits: list[tuple[str, float]] = []
     for keyword, weight in table.items():
-        parts = keyword.split()
+        normalized_keyword = normalize_title(keyword)
+        parts = normalized_keyword.split()
         if len(parts) == 1:
             if parts[0] in tokens:
                 hits.append((keyword, weight))
-        elif " ".join(parts) in normalized:
+        elif f" {normalized_keyword} " in f" {normalized} ":
             hits.append((keyword, weight))
     if not hits:
         return 0.0
@@ -189,20 +196,32 @@ class TrendAnalyzer:
         window = timedelta(minutes=self._settings.trend_topic_window_minutes)
         recent_cutoff = reference - window
 
-        by_category: dict[Category, int] = Counter()
-        for item in items:
-            if item.published_at is None or item.published_at >= recent_cutoff:
-                by_category[item.category] += 1
-
-        return [
-            self.score_item(
-                item,
-                reference,
-                topic_count=by_category.get(item.category, 1),
-                source_count=1,
-            )
+        recent = [
+            item
             for item in items
+            if item.published_at is None or item.published_at >= recent_cutoff
         ]
+        scores: list[TrendComponents] = []
+        for item in items:
+            tokens = token_set(item.title)
+            topic_count = sum(
+                1
+                for other in recent
+                if other.category is item.category
+                and (
+                    other is item
+                    or overlap_coefficient(tokens, token_set(other.title)) >= TOPIC_TITLE_OVERLAP
+                )
+            )
+            scores.append(
+                self.score_item(
+                    item,
+                    reference,
+                    topic_count=max(1, topic_count),
+                    source_count=1,
+                )
+            )
+        return scores
 
     def score_record(
         self,

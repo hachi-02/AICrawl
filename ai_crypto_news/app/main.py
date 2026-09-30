@@ -28,6 +28,7 @@ Các lệnh CLI::
     python -m app.main probe           # xuất thông tin fingerprint browser
     python -m app.main init-db         # chỉ tạo database
     python -m app.main stats           # in thống kê
+    python -m app.main skip-existing   # bỏ qua tin cũ trước khi bật Telegram
 """
 
 from __future__ import annotations
@@ -47,16 +48,18 @@ from telegram.error import TelegramError
 from app.config import BrowserEngine, Settings, get_settings
 from app.crawler.browser import BrowserManager
 from app.crawler.sources import SourceCrawler, create_sources
-from app.database.models import Category, CrawlStats, NewsItem
+from app.database.models import Category, CrawlStats, NewsItem, NewsRecord
 from app.database.repository import NewsRepository
 from app.dedupe.deduplicator import Deduplicator, MatchKind
-from app.dedupe.normalizer import utcnow
+from app.dedupe.normalizer import hours_since, overlap_coefficient, token_set, utcnow
 from app.logging_config import get_logger, setup_logging
 from app.telegram.bot import NewsTelegramBot, TelegramNotifier
 from app.telegram.formatter import format_status
 from app.trend.analyzer import TrendAnalyzer
 
 logger = get_logger("app.main")
+
+TOPIC_TITLE_OVERLAP = 0.4
 
 
 class Pipeline:
@@ -94,38 +97,44 @@ class Pipeline:
         stats.run_id = await self.repository.start_run(now)
         logger.info("=== Bắt đầu vòng crawl (%s), run_id=%s ===", reason, stats.run_id)
 
-        sources, _ = create_sources(self.settings, category=category, only=only)
-        stats.sources_total = len(sources)
-
         try:
-            await self.browser.ensure_alive()
-            outcome = await self.crawler.crawl_sources(sources, run_id=str(stats.run_id))
-        except Exception as exc:  # noqa: BLE001 - browser hỏng không được làm sập tiến trình
-            logger.exception("Không crawl được: %s", exc)
-            stats.errors.append(f"crawl: {exc}")
+            sources, _ = create_sources(self.settings, category=category, only=only)
+            stats.sources_total = len(sources)
+
+            try:
+                await self.browser.ensure_alive()
+                outcome = await self.crawler.crawl_sources(sources, run_id=str(stats.run_id))
+            except Exception as exc:  # noqa: BLE001 - browser hỏng không được làm sập tiến trình
+                logger.exception("Không crawl được: %s", exc)
+                stats.errors.append(f"crawl: {exc}")
+                return stats
+
+            stats.articles_found = outcome.total_articles
+            stats.sources_failed = len(outcome.failed_sources)
+            stats.sources_ok = stats.sources_total - stats.sources_failed
+            for result in outcome.per_source:
+                if result.error:
+                    stats.errors.append(f"{result.source}: {result.error}")
+
+            new_items, new_ids, linked, linked_ids = await self._deduplicate_and_store(outcome.items, now)
+            stats.new_articles = len(new_items)
+            stats.duplicates = len(outcome.items) - len(new_items)
+            stats.extra_sources_linked = linked
+
+            affected_ids = list(dict.fromkeys([*new_ids, *linked_ids]))
+            await self._apply_trend_scores(affected_ids, now)
+            await self._broadcast(now, stats)
+            return stats
+        except asyncio.CancelledError:
+            stats.errors.append("pipeline: cancelled")
+            raise
+        except Exception as exc:
+            stats.errors.append(f"pipeline: {type(exc).__name__}: {exc}")
+            raise
+        finally:
             stats.finished_at = utcnow()
             await self.repository.finish_run(stats)
-            return stats
-
-        stats.articles_found = outcome.total_articles
-        stats.sources_failed = len(outcome.failed_sources)
-        stats.sources_ok = stats.sources_total - stats.sources_failed
-        for result in outcome.per_source:
-            if result.error:
-                stats.errors.append(f"{result.source}: {result.error}")
-
-        new_items, new_ids, linked = await self._deduplicate_and_store(outcome.items, now)
-        stats.new_articles = len(new_items)
-        stats.duplicates = len(outcome.items) - len(new_items)
-        stats.extra_sources_linked = linked
-
-        await self._apply_trend_scores(new_ids, new_items, now)
-        await self._broadcast(now, stats)
-
-        stats.finished_at = utcnow()
-        await self.repository.finish_run(stats)
-        self._log_stats(stats, time.monotonic() - started_wall)
-        return stats
+            self._log_stats(stats, time.monotonic() - started_wall)
 
     # ------------------------------------------------------------------
     # Các bước
@@ -135,13 +144,13 @@ class Pipeline:
         self,
         items: list[NewsItem],
         now: datetime,
-    ) -> tuple[list[NewsItem], list[int], int]:
+    ) -> tuple[list[NewsItem], list[int], int, list[int]]:
         """Chống trùng rồi ghi vào SQLite.
 
-        Trả về ``(tin mới, id database của các tin mới, số nguồn liên kết thêm)``.
+        Trả về ``(tin mới, id tin mới, số URL liên kết thêm, id tin được liên kết)``.
         """
         if not items:
-            return [], [], 0
+            return [], [], 0, []
 
         await self.deduplicator.load_index(now)
         decisions = await self.deduplicator.classify_many(items)
@@ -157,12 +166,14 @@ class Pipeline:
         decisions = self.deduplicator.resolve_ids(decisions, inserted)
 
         linked = 0
+        linked_ids: list[int] = []
         for decision in decisions:
             if not decision.is_duplicate or decision.news_id is None or decision.news_id <= 0:
                 continue
             try:
                 if await self.repository.link_source(decision.news_id, decision.item, now=now):
                     linked += 1
+                    linked_ids.append(decision.news_id)
                     logger.info(
                         "Trùng tin (%s%s): gắn nguồn %s vào bản tin #%d",
                         decision.kind.value,
@@ -178,45 +189,51 @@ class Pipeline:
                     exc,
                 )
 
-        return new_items, [news_id for news_id, _ in inserted], linked
+        inserted_items = [item for _, item in inserted]
+        return inserted_items, [news_id for news_id, _ in inserted], linked, linked_ids
 
     async def _apply_trend_scores(
         self,
-        new_ids: Sequence[int],
-        new_items: list[NewsItem],
+        news_ids: Sequence[int],
         now: datetime,
     ) -> None:
-        """Tính và lưu trend_score cho các tin mới (id đã có sẵn từ lần insert)."""
-        if not new_ids or not new_items:
+        """Tính lại trend_score cho tin mới và tin vừa được gắn thêm nguồn."""
+        if not news_ids:
             return
-        # Đọc lại source_count sau khi đã gắn nguồn: tin mới có thể đã được
-        # link thêm nguồn phụ trong chính vòng ghi này.
-        source_counts = await self.repository.get_source_counts(new_ids)
+        affected = await self.repository.get_records(news_ids)
+        recent = await self.repository.select_recent(
+            self.settings.trend_topic_window_minutes,
+            now=now,
+        )
+        by_id = {record.id: record for record in recent}
+        by_id.update({record.id: record for record in affected})
+        records = list(by_id.values())
         scores: dict[int, float] = {}
-        for news_id, item in zip(new_ids, new_items, strict=True):
-            components = self.analyzer.score_item(
-                item,
+        for record in records:
+            components = self.analyzer.score_record(
+                record,
                 now,
-                topic_count=self._topic_count(item, new_items, now),
-                source_count=source_counts.get(news_id, 1),
+                topic_count=self._topic_count(record, recent, now),
             )
-            scores[news_id] = components.total
+            scores[record.id] = components.total
         await self.repository.update_trend_scores(scores)
-        multi = sum(1 for value in source_counts.values() if value > 1)
-        logger.info("Đã tính trend score cho %d tin mới", len(scores))
+        multi = sum(1 for record in records if record.source_count > 1)
+        logger.info("Đã tính lại trend score cho %d tin liên quan", len(scores))
         if multi:
             logger.info("Trong đó %d tin được cộng điểm đa nguồn", multi)
 
-    def _topic_count(self, item: NewsItem, items: list[NewsItem], now: datetime) -> int:
-        """Số bài cùng chủ đề trong cửa sổ thời gian (độ phổ biến chủ đề)."""
-        from app.dedupe.normalizer import hours_since
-
+    def _topic_count(self, record: NewsRecord, records: list[NewsRecord], now: datetime) -> int:
+        """Đếm bài gần thời gian và có tiêu đề chồng lấn đủ để coi là cùng chủ đề."""
         window = self.settings.trend_topic_window_minutes / 60.0
+        tokens = token_set(record.title)
         count = 0
-        for other in items:
-            if other.category is not item.category:
+        for other in records:
+            if other.category is not record.category:
                 continue
-            if hours_since(other.published_at, now) <= window:
+            timestamp = other.published_at or other.first_seen_at
+            if hours_since(timestamp, now) > window:
+                continue
+            if other.id == record.id or overlap_coefficient(tokens, token_set(other.title)) >= TOPIC_TITLE_OVERLAP:
                 count += 1
         return max(1, count)
 
@@ -226,19 +243,19 @@ class Pipeline:
             logger.info("Dry-run: bỏ qua bước gửi Telegram")
             return
 
-        candidates = await self.repository.select_unreported(
-            min_score=self.settings.trend_min_score,
-            max_age_hours=self.settings.trend_max_age_hours,
-            limit=self.settings.trend_max_per_category * 2,
-            now=now,
-        )
-        selected: list[object] = []
+        selected: list[NewsRecord] = []
         counts: dict[Category, int] = {Category.AI: 0, Category.CRYPTO: 0}
-        for record in candidates:
-            if counts[record.category] >= self.settings.trend_max_per_category:
-                continue
-            selected.append(record)
-            counts[record.category] += 1
+        for category in Category:
+            records = await self.repository.select_trending(
+                category=category,
+                min_score=self.settings.trend_min_score,
+                max_age_hours=self.settings.trend_max_age_hours,
+                limit=self.settings.trend_max_per_category,
+                now=now,
+                only_unreported=True,
+            )
+            selected.extend(records)
+            counts[category] = len(records)
 
         logger.info(
             "Tin trending AI: %d | CRYPTO: %d (ngưỡng %.2f)",
@@ -249,7 +266,7 @@ class Pipeline:
             return
 
         try:
-            sent, failed = await self.notifier.send_trending(selected, now)  # type: ignore[arg-type]
+            sent, failed = await self.notifier.send_trending(selected, now)
             stats.telegram_sent = sent
             stats.telegram_failed = failed
             if failed:
@@ -456,6 +473,21 @@ async def cmd_stats(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_skip_existing(settings: Settings, args: argparse.Namespace) -> int:
+    """Bỏ qua toàn bộ tin hiện có để Telegram chỉ gửi tin phát sinh về sau."""
+    repository = await build_repository(settings)
+    try:
+        count = await repository.count_unhandled()
+        if args.dry_run:
+            print(f"Sẽ đánh dấu bỏ qua {count} tin hiện có (database chưa thay đổi).")
+            return 0
+        skipped = await repository.skip_unhandled()
+        print(f"Đã đánh dấu bỏ qua {skipped} tin hiện có. Telegram sẽ chỉ gửi tin mới.")
+        return 0
+    finally:
+        await repository.close()
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -487,6 +519,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = sub.add_parser("stats", help="in thống kê database")
     stats.set_defaults(func=cmd_stats)
+
+    skip_existing = sub.add_parser(
+        "skip-existing",
+        help="bỏ qua tin hiện có để Telegram chỉ gửi tin phát sinh về sau",
+    )
+    skip_existing.add_argument("--dry-run", action="store_true", help="chỉ in số tin, không thay đổi database")
+    skip_existing.set_defaults(func=cmd_skip_existing, dry_run=False)
 
     return parser
 

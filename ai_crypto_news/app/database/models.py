@@ -104,6 +104,7 @@ class NewsRecord(BaseModel):
     source_count: int = 1
     trend_score: float = 0.0
     is_reported: bool = False
+    is_skipped: bool = False
     reported_at: datetime | None = None
     telegram_message_id: int | None = None
     first_seen_at: datetime | None = None
@@ -191,6 +192,7 @@ def row_to_record(row: Any, extra_urls: list[str] | None = None) -> NewsRecord:
     data = dict(row)
     data.pop("extra_urls", None)
     data["is_reported"] = bool(data.get("is_reported"))
+    data["is_skipped"] = bool(data.get("is_skipped"))
     data["category"] = Category(data["category"])
     data["published_at"] = parse_datetime(data.get("published_at"))
     data["reported_at"] = parse_datetime(data.get("reported_at"))

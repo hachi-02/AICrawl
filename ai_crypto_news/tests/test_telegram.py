@@ -29,6 +29,7 @@ class FakeBot:
 
     def __init__(self, fail_times: int = 0) -> None:
         self.sent: list[str] = []
+        self.sent_kwargs: list[dict[str, Any]] = []
         self.calls = 0
         self._fail_times = fail_times
         self._next_id = 100
@@ -40,6 +41,7 @@ class FakeBot:
             self._fail_times -= 1
             raise RuntimeError("Telegram lỗi giả lập")
         self.sent.append(text)
+        self.sent_kwargs.append(kwargs)
         self._next_id += 1
         return FakeMessage(self._next_id)
 
@@ -249,6 +251,31 @@ class TestGrouping:
 
 
 class TestApplication:
+    async def test_reply_targets_the_chat_that_sent_the_command(
+        self, repository: NewsRepository, notifier_settings: Settings
+    ) -> None:
+        settings = notifier_settings.model_copy(update={"telegram_allowed_user_ids": "123"})
+        notifier, fake_bot = build_notifier(repository, settings)
+
+        async def run_crawl(_reason: str):
+            raise AssertionError("Không được crawl khi chỉ phản hồi lệnh")
+
+        telegram = NewsTelegramBot(settings, repository, run_crawl, notifier=notifier)
+        update = type(
+            "FakeUpdate",
+            (),
+            {
+                "effective_user": type("User", (), {"id": 123})(),
+                "effective_chat": type("Chat", (), {"id": 456})(),
+                "effective_message": type("Message", (), {"message_id": 789})(),
+            },
+        )()
+
+        await telegram._reply(update, "pong")  # type: ignore[arg-type]
+        assert fake_bot.sent == ["pong"]
+        assert fake_bot.sent_kwargs[0]["chat_id"] == "456"
+        assert fake_bot.sent_kwargs[0]["reply_to_message_id"] == 789
+
     async def test_build_includes_job_queue(
         self, repository: NewsRepository, notifier_settings: Settings
     ) -> None:
@@ -258,3 +285,102 @@ class TestApplication:
         telegram = NewsTelegramBot(notifier_settings, repository, run_crawl)
         application = telegram.build()
         assert application.job_queue is not None
+
+    async def test_scheduler_uses_supported_job_queue_arguments(
+        self, repository: NewsRepository, notifier_settings: Settings
+    ) -> None:
+        async def run_crawl(_reason: str):
+            raise AssertionError("Không được crawl khi chỉ đăng ký scheduler")
+
+        telegram = NewsTelegramBot(notifier_settings, repository, run_crawl)
+        application = telegram.build()
+        telegram.start_scheduler()
+        telegram.start_scheduler()
+
+        assert application.job_queue is not None
+        assert len(application.job_queue.get_jobs_by_name("crawl-job")) == 1
+
+    async def test_startup_schedules_without_crawling(
+        self, repository: NewsRepository, notifier_settings: Settings
+    ) -> None:
+        crawl_calls: list[str] = []
+
+        async def run_crawl(reason: str):
+            crawl_calls.append(reason)
+            raise AssertionError("Startup không được tự crawl")
+
+        notifier, _ = build_notifier(repository, notifier_settings)
+        telegram = NewsTelegramBot(notifier_settings, repository, run_crawl, notifier=notifier)
+        application = telegram.build()
+
+        await telegram.on_startup(application)
+
+        assert crawl_calls == []
+        assert await repository.get_app_setting("auto_crawl_enabled") == "1"
+        assert application.job_queue is not None
+        assert len(application.job_queue.get_jobs_by_name("crawl-job")) == 1
+
+    async def test_auto_off_persists_across_bot_instances(
+        self, repository: NewsRepository, notifier_settings: Settings
+    ) -> None:
+        settings = notifier_settings.model_copy(update={"telegram_allowed_user_ids": "123"})
+
+        async def run_crawl(_reason: str):
+            raise AssertionError("Lệnh /auto không được crawl ngay")
+
+        notifier, fake_bot = build_notifier(repository, settings)
+        telegram = NewsTelegramBot(settings, repository, run_crawl, notifier=notifier)
+        application = telegram.build()
+        telegram.start_scheduler()
+        update = type(
+            "FakeUpdate",
+            (),
+            {
+                "effective_user": type("User", (), {"id": 123})(),
+                "effective_chat": type("Chat", (), {"id": 456})(),
+                "effective_message": type("Message", (), {"message_id": 789})(),
+            },
+        )()
+        context = type("Context", (), {"args": ["off"], "application": application})()
+
+        await telegram._cmd_auto(update, context)  # type: ignore[arg-type]
+
+        assert await repository.get_app_setting("auto_crawl_enabled") == "0"
+        assert application.job_queue is not None
+        assert application.job_queue.get_jobs_by_name("crawl-job") == ()
+        assert "đã tắt" in fake_bot.sent[-1]
+
+        restarted = NewsTelegramBot(settings, repository, run_crawl, notifier=notifier)
+        assert await restarted._get_auto_crawl_enabled() is False
+
+    async def test_auto_on_schedules_without_crawling(
+        self, repository: NewsRepository, notifier_settings: Settings
+    ) -> None:
+        settings = notifier_settings.model_copy(update={"telegram_allowed_user_ids": "123"})
+        await repository.set_app_setting("auto_crawl_enabled", "0", now=NOW)
+        crawl_calls: list[str] = []
+
+        async def run_crawl(reason: str):
+            crawl_calls.append(reason)
+            raise AssertionError("Lệnh /auto on không được crawl ngay")
+
+        notifier, _ = build_notifier(repository, settings)
+        telegram = NewsTelegramBot(settings, repository, run_crawl, notifier=notifier)
+        application = telegram.build()
+        update = type(
+            "FakeUpdate",
+            (),
+            {
+                "effective_user": type("User", (), {"id": 123})(),
+                "effective_chat": type("Chat", (), {"id": 456})(),
+                "effective_message": type("Message", (), {"message_id": 789})(),
+            },
+        )()
+        context = type("Context", (), {"args": ["on"], "application": application})()
+
+        await telegram._cmd_auto(update, context)  # type: ignore[arg-type]
+
+        assert crawl_calls == []
+        assert await repository.get_app_setting("auto_crawl_enabled") == "1"
+        assert application.job_queue is not None
+        assert len(application.job_queue.get_jobs_by_name("crawl-job")) == 1

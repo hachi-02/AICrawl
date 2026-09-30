@@ -14,6 +14,13 @@ CHAT = "@test_chat"
 
 
 class TestInsert:
+    async def test_app_setting_roundtrip(self, repository: NewsRepository) -> None:
+        assert await repository.get_app_setting("auto_crawl_enabled") is None
+        await repository.set_app_setting("auto_crawl_enabled", "0", now=NOW)
+        assert await repository.get_app_setting("auto_crawl_enabled") == "0"
+        await repository.set_app_setting("auto_crawl_enabled", "1", now=NOW)
+        assert await repository.get_app_setting("auto_crawl_enabled") == "1"
+
     async def test_insert_returns_aligned_ids(self, repository: NewsRepository) -> None:
         items = [
             make_item("Bài số một về AI", url="https://techcrunch.com/1/"),
@@ -165,8 +172,43 @@ class TestLinkSource:
         assert record is not None
         assert record.published_at == NOW - timedelta(hours=6)
 
+    async def test_link_sets_published_at_when_primary_is_missing(self, repository: NewsRepository) -> None:
+        primary = make_item("Bài chưa có giờ đăng")
+        primary.published_at = None
+        (news_id, _), = await repository.insert_items([primary], now=NOW)
+        await repository.link_source(
+            news_id,
+            make_item(
+                "Bài chưa có giờ đăng",
+                source="decrypt",
+                url="https://decrypt.co/with-time",
+                published_at=NOW - timedelta(hours=2),
+            ),
+            now=NOW,
+        )
+        record = await repository.get_record(news_id)
+        assert record is not None
+        assert record.published_at == NOW - timedelta(hours=2)
+
 
 class TestReported:
+    async def test_skip_unhandled_keeps_delivery_stats_honest(self, repository: NewsRepository) -> None:
+        await repository.insert_items([make_item("Tin cũ không cần gửi")], now=NOW)
+        assert await repository.count_unhandled() == 1
+        assert await repository.skip_unhandled() == 1
+        assert await repository.count_unhandled() == 0
+
+        record = await repository.get_record(1)
+        assert record is not None
+        assert record.is_skipped is True
+        assert record.is_reported is False
+        assert await repository.is_reported(1) is True
+        assert await repository.select_unreported(0.0, 24, 10, now=NOW) == []
+        stats = await repository.get_stats()
+        assert stats["reported"] == 0
+        assert stats["skipped"] == 1
+        assert stats["unreported"] == 0
+
     async def test_mark_reported_once(self, repository: NewsRepository) -> None:
         (news_id, _), = await repository.insert_items([make_item("Bài gửi đúng một lần")], now=NOW)
         assert await repository.mark_reported(news_id, message_id=555, chat_id=CHAT, now=NOW) is True

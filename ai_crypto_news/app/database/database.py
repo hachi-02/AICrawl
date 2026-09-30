@@ -109,6 +109,27 @@ MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             "ALTER TABLE news ADD COLUMN engagement_score REAL NOT NULL DEFAULT 0.0",
         ),
     ),
+    (
+        3,
+        "add_skipped_flag",
+        (
+            "ALTER TABLE news ADD COLUMN is_skipped INTEGER NOT NULL DEFAULT 0 CHECK (is_skipped IN (0, 1))",
+            "CREATE INDEX IF NOT EXISTS idx_news_delivery_state ON news(is_reported, is_skipped)",
+        ),
+    ),
+    (
+        4,
+        "add_app_settings",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 

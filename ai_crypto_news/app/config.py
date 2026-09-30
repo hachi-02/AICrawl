@@ -113,7 +113,8 @@ class Settings(BaseSettings):
     telegram_retry_base_delay: float = Field(default=2.0, ge=0.1)
 
     # ---------------- Scheduler ----------------
-    crawl_interval_minutes: int = Field(default=10, ge=1)
+    auto_crawl_enabled: bool = True
+    crawl_interval_minutes: int = Field(default=1440, ge=1)
 
     @field_validator("log_level")
     @classmethod

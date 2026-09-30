@@ -73,6 +73,28 @@ class TestExactLayers:
 
 
 class TestFuzzySameSource:
+    async def test_persisted_index_uses_each_fingerprint_position(
+        self, repository: NewsRepository, settings: Settings
+    ) -> None:
+        dedup = Deduplicator(repository, settings)
+        await _seed(
+            repository,
+            dedup,
+            [
+                make_item("OpenAI releases GPT-5 model to all users", url="https://techcrunch.com/first/"),
+                make_item("Nvidia unveils a completely different GPU", url="https://techcrunch.com/last/"),
+            ],
+        )
+
+        decision = await dedup.classify(
+            make_item(
+                "OpenAI releases GPT-5 model for free to users",
+                url="https://techcrunch.com/rewrite/",
+            )
+        )
+        assert decision.kind is MatchKind.FUZZY
+        assert decision.news_id == 1
+
     async def test_minor_rewrite_merged(self, repository: NewsRepository, settings: Settings) -> None:
         dedup = Deduplicator(repository, settings)
         await _seed(repository, dedup, [make_item("OpenAI releases GPT-5 model to all users")])
@@ -113,6 +135,30 @@ class TestFuzzySameSource:
 
 
 class TestFuzzyCrossSource:
+    async def test_never_merges_across_categories(
+        self, repository: NewsRepository, tmp_path
+    ) -> None:
+        settings = Settings(
+            _env_file=None,
+            database_path=tmp_path / "s.db",
+            dedupe_cross_source_overlap=0.5,
+        )
+        dedup = Deduplicator(repository, settings)
+        await _seed(
+            repository,
+            dedup,
+            [make_item("Nvidia AI token market surges today", category=Category.CRYPTO, source="coindesk")],
+        )
+        decision = await dedup.classify(
+            make_item(
+                "Nvidia AI token market surges today",
+                category=Category.AI,
+                source="theverge",
+                url="https://theverge.com/nvidia-ai-token",
+            )
+        )
+        assert decision.kind is MatchKind.NEW
+
     async def test_disabled_by_default_when_threshold_zero(
         self, repository: NewsRepository, tmp_path
     ) -> None:
@@ -251,6 +297,25 @@ class TestBatch:
         resolved = dedup.resolve_ids(decisions, inserted)
 
         assert {d.news_id for d in resolved} == {1}
+
+    async def test_resolve_ids_does_not_shift_when_an_insert_is_skipped(
+        self, repository: NewsRepository, tmp_path
+    ) -> None:
+        settings = Settings(
+            _env_file=None,
+            database_path=tmp_path / "s.db",
+            dedupe_jaccard_threshold=0.0,
+            dedupe_cross_source_overlap=0.0,
+        )
+        dedup = Deduplicator(repository, settings)
+        first = make_item("First unique article", url="https://techcrunch.com/first/")
+        second = make_item("Second unique article", url="https://techcrunch.com/second/")
+        decisions = await dedup.classify_many([first, second])
+        inserted = await repository.insert_items([second], now=NOW)
+
+        resolved = dedup.resolve_ids(decisions, inserted)
+        assert resolved[0].news_id == -1
+        assert resolved[1].news_id == inserted[0][0]
 
     async def test_index_updated_after_batch(self, repository: NewsRepository, settings: Settings) -> None:
         dedup = Deduplicator(repository, settings)

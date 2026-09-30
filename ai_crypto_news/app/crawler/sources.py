@@ -173,7 +173,8 @@ class SourceCrawler:
         """Giới hạn thời gian cho một nguồn và đóng context dù thành công hay lỗi."""
         budget = source.spec.source_budget_seconds(self._settings.source_timeout_seconds)
         async with asyncio.timeout(budget):
-            async with self._browser.context_session(run_id) as context:
+            trace_id = f"{run_id}_{source.name}" if run_id else None
+            async with self._browser.context_session(trace_id) as context:
                 return await source.crawl(context)
 
     async def _recover_browser(self, error: BaseException) -> None:

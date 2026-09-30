@@ -259,21 +259,36 @@ class RobotsGuard:
         """True nếu robots.txt cho phép tải URL này."""
         if not self._enabled:
             return True
-        parts = urlsplit(url)
-        if not parts.netloc:
-            return True
-        origin = f"{parts.scheme}://{parts.netloc}"
-        async with self._lock:
-            if origin not in self._parsers:
-                self._parsers[origin] = await self._load(origin)
-        parser = self._parsers.get(origin)
+        parser = await self._get_parser(url)
         if parser is None:
             return True
         try:
             return parser.can_fetch(self._user_agent, url)
         except Exception as exc:  # noqa: BLE001 - robots lỗi thì cho qua nhưng log
-            logger.warning("Không đọc được robots.txt cho %s: %s", origin, exc)
+            logger.warning("Không đọc được robots.txt cho %s: %s", url, exc)
             return True
+
+    async def crawl_delay(self, url: str) -> float | None:
+        """Trả crawl-delay áp dụng cho user-agent hiện tại hoặc nhóm wildcard."""
+        if not self._enabled:
+            return None
+        parser = await self._get_parser(url)
+        if parser is None:
+            return None
+        delay = parser.crawl_delay(self._user_agent)
+        if delay is None:
+            delay = parser.crawl_delay("*")
+        return float(delay) if delay is not None else None
+
+    async def _get_parser(self, url: str) -> RobotFileParser | None:
+        parts = urlsplit(url)
+        if not parts.netloc:
+            return None
+        origin = f"{parts.scheme}://{parts.netloc}"
+        async with self._lock:
+            if origin not in self._parsers:
+                self._parsers[origin] = await self._load(origin)
+        return self._parsers.get(origin)
 
     async def _load(self, origin: str) -> RobotFileParser | None:
         parser = RobotFileParser()
@@ -480,6 +495,9 @@ class ListPageSource(NewsSource):
     # -- luồng crawl -----------------------------------------------------
 
     async def crawl(self, context: BrowserContext) -> list[NewsItem]:
+        if not await self._robots.is_allowed(self.start_url):
+            logger.info("[%s] Bỏ qua trang listing do robots.txt: %s", self.name, self.start_url)
+            return []
         page = await context.new_page()
         items: list[NewsItem] = []
         try:
@@ -507,6 +525,8 @@ class ListPageSource(NewsSource):
                     self.name, self.start_url,
                 )
 
+            if candidates:
+                await self._respect_delay(self.start_url)
             for url in candidates:
                 item = await self._crawl_single(context, url)
                 if item is not None:
@@ -558,12 +578,14 @@ class ListPageSource(NewsSource):
             return None
         finally:
             await page.close()
-            await self._respect_delay()
+            await self._respect_delay(url)
 
-    async def _respect_delay(self) -> None:
-        delay = self.spec.crawl_delay or self.settings.request_delay_seconds
+    async def _respect_delay(self, url: str) -> None:
+        configured_delay = self.spec.crawl_delay or self.settings.request_delay_seconds
+        robots_delay = await self._robots.crawl_delay(url) or 0.0
+        delay = max(robots_delay, configured_delay * random.uniform(0.7, 1.3))
         if delay > 0:
-            await asyncio.sleep(delay * random.uniform(0.7, 1.3))  # noqa: S311 - jitter chống dồn request
+            await asyncio.sleep(delay)
 
 
 _PUNCT_TAIL_RE = re.compile(r"[\s\|\-–—:»>]+$")

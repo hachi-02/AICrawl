@@ -189,6 +189,7 @@ def format_status(
         f"• Tổng tin: {stats.get('total', 0)}\n"
         f"• {category_text}\n"
         f"• Đã gửi Telegram: {stats.get('reported', 0)}\n"
+        f"• Đã bỏ qua: {stats.get('skipped', 0)}\n"
         f"• Chưa gửi: {stats.get('unreported', 0)}\n"
         f"• Tin 24h qua: {stats.get('last_24h', 0)}\n"
         f"• Số lượt nguồn: {stats.get('source_mentions', 0)} (bảng news_sources: {stats.get('extra_sources', 0)})\n\n"

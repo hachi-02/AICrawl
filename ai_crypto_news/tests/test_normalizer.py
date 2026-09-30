@@ -46,6 +46,9 @@ class TestCanonicalizeUrl:
         url = "https://example.com/news/btc?currency=usd&utm_source=twitter"
         assert canonicalize_url(url) == "https://example.com/news/btc?currency=usd"
 
+    def test_removes_http_default_port_before_upgrading_scheme(self) -> None:
+        assert canonicalize_url("http://example.com:80/article") == "https://example.com/article"
+
     def test_amp_suffix_removed(self) -> None:
         assert canonicalize_url("https://www.coindesk.com/news/btc/amp/") == "https://coindesk.com/news/btc"
 

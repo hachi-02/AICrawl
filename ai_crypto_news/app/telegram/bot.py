@@ -46,6 +46,7 @@ logger = get_logger(__name__)
 CrawlCallable = Callable[[str], Awaitable[CrawlStats]]
 
 RETRYABLE_ERRORS: tuple[type[TelegramError], ...] = (TimedOut, NetworkError)
+AUTO_CRAWL_SETTING = "auto_crawl_enabled"
 
 
 class TelegramNotifier:
@@ -80,12 +81,22 @@ class TelegramNotifier:
     # Gửi thô
     # ------------------------------------------------------------------
 
-    async def _send_with_retry(self, text: str, reply_to: int | None = None) -> int | None:
+    async def _send_with_retry(
+        self,
+        text: str,
+        reply_to: int | None = None,
+        chat_id: str | None = None,
+    ) -> int | None:
         """Gửi 1 message (tự chia nhỏ nếu quá 4096 ký tự). Trả về message_id hoặc None."""
+        target_chat_id = chat_id or self._chat_id
         chunks = split_message(text, TELEGRAM_MAX_LENGTH)
         first_message_id: int | None = None
         for index, chunk in enumerate(chunks):
-            message_id = await self._send_chunk(chunk, reply_to if index == 0 else None)
+            message_id = await self._send_chunk(
+                chunk,
+                reply_to if index == 0 else None,
+                target_chat_id,
+            )
             if message_id is None:
                 # Không đánh dấu cả nhóm đã gửi nếu Telegram chỉ nhận được một
                 # phần. Vòng sau sẽ thử lại thay vì làm mất các chunk còn lại.
@@ -94,13 +105,13 @@ class TelegramNotifier:
                 first_message_id = message_id
         return first_message_id
 
-    async def _send_chunk(self, text: str, reply_to: int | None) -> int | None:
+    async def _send_chunk(self, text: str, reply_to: int | None, chat_id: str) -> int | None:
         """Gửi một chunk có retry + backoff. Không raise, chỉ log."""
         attempts = self._settings.telegram_max_retries
         for attempt in range(1, attempts + 1):
             try:
                 message = await self._bot.send_message(
-                    chat_id=self._chat_id,
+                    chat_id=chat_id,
                     text=text,
                     parse_mode=None,
                     disable_web_page_preview=False,
@@ -114,7 +125,7 @@ class TelegramNotifier:
             except Forbidden as exc:
                 logger.error(
                     "Telegram từ chối gửi tới chat %s (bot bị chặn hoặc sai chat id): %s",
-                    self._chat_id, exc,
+                    chat_id, exc,
                 )
                 return None
             except BadRequest as exc:
@@ -152,11 +163,16 @@ class TelegramNotifier:
         logger.error("Gửi Telegram thất bại sau %d lần thử", attempts)
         return None
 
-    async def send_text(self, text: str) -> bool:
+    async def send_text(
+        self,
+        text: str,
+        chat_id: str | None = None,
+        reply_to: int | None = None,
+    ) -> bool:
         """Gửi text thuần (dùng cho phản hồi lệnh)."""
         if self._settings.telegram_rate_limit_seconds > 0:
             await asyncio.sleep(self._settings.telegram_rate_limit_seconds)
-        return await self._send_with_retry(text) is not None
+        return await self._send_with_retry(text, reply_to=reply_to, chat_id=chat_id) is not None
 
     # ------------------------------------------------------------------
     # Gửi tin nổi bật
@@ -247,9 +263,10 @@ Lệnh có sẵn:
 /trending - top tin đang nổi bật
 /status - trạng thái crawler và database
 /crawl - chạy crawl thủ công ngay bây giờ
+/auto on|off|status - bật, tắt hoặc xem trạng thái crawl tự động
 /help - danh sách lệnh
 
-Tin tự động được gửi theo lịch và chỉ gửi mỗi tin một lần."""
+Tin tự động được gửi tối đa một lần mỗi bài."""
 
 WELCOME_TEXT = """👋 Chào bạn! Tôi theo dõi tin AI và Crypto và gửi tin nổi bật.
 
@@ -270,8 +287,10 @@ class NewsTelegramBot:
         self._repo = repository
         self._run_crawl = run_crawl
         self._crawl_lock = asyncio.Lock()
+        self._auto_lock = asyncio.Lock()
         self._application: Application | None = None
         self._notifier = notifier
+        self._auto_crawl_enabled: bool | None = None
 
     # ------------------------------------------------------------------
     # Khởi tạo
@@ -298,6 +317,7 @@ class NewsTelegramBot:
         application.add_handler(CommandHandler("trending", self._cmd_trending))
         application.add_handler(CommandHandler("status", self._cmd_status))
         application.add_handler(CommandHandler("crawl", self._cmd_crawl))
+        application.add_handler(CommandHandler("auto", self._cmd_auto))
         application.add_error_handler(self._on_error)
 
         self._application = application
@@ -322,11 +342,16 @@ class NewsTelegramBot:
     # ------------------------------------------------------------------
 
     async def on_startup(self, _application: Application) -> None:
-        """Chạy sau khi bot khởi động: báo tin, crawl một vòng, rồi lên lịch."""
+        """Khôi phục lịch tự động nhưng không crawl ngay khi process khởi động."""
         logger.info("Telegram bot đã khởi động (chat id: %s)", self._settings.telegram_chat_id)
-        await self._announce("🚀 Đã khởi động. Đang chạy một vòng crawl đầu tiên…")
-        await self._run_scheduled_crawl("startup")
-        self.start_scheduler()
+        enabled = await self._get_auto_crawl_enabled()
+        if enabled:
+            self.start_scheduler()
+        state = "bật" if enabled else "tắt"
+        await self._announce(
+            f"🚀 Bot đã khởi động. Crawl tự động: {state}. "
+            f"Dùng /crawl để cập nhật ngay hoặc /auto status để xem lịch."
+        )
 
     async def on_shutdown(self, _application: Application) -> None:
         logger.info("Telegram bot đang tắt")
@@ -335,17 +360,63 @@ class NewsTelegramBot:
         """Đăng ký job crawl định kỳ trên JobQueue của PTB."""
         if self._application is None:
             raise RuntimeError("Chưa build() Application")
+        if self._application.job_queue is None:
+            raise RuntimeError("Thiếu JobQueue; hãy cài python-telegram-bot[job-queue]")
+        self.stop_scheduler()
         interval = timedelta(minutes=self._settings.crawl_interval_minutes)
         self._application.job_queue.run_repeating(
             self._scheduled_job,
             interval=interval,
             first=interval,
             name="crawl-job",
-            coalesce=True,
+            job_kwargs={"coalesce": True},
         )
-        logger.info("Đã lên lịch crawl mỗi %d phút", self._settings.crawl_interval_minutes)
+        logger.info("Đã lên lịch crawl %s", self._interval_text())
+
+    def stop_scheduler(self) -> int:
+        """Hủy mọi job crawl đang đăng ký và trả số job đã hủy."""
+        if self._application is None or self._application.job_queue is None:
+            return 0
+        jobs = self._application.job_queue.get_jobs_by_name("crawl-job")
+        for job in jobs:
+            job.schedule_removal()
+        if jobs:
+            logger.info("Đã hủy %d lịch crawl tự động", len(jobs))
+        return len(jobs)
+
+    def _interval_text(self) -> str:
+        minutes = self._settings.crawl_interval_minutes
+        if minutes % 1440 == 0:
+            return f"mỗi {minutes // 1440} ngày"
+        if minutes % 60 == 0:
+            return f"mỗi {minutes // 60} giờ"
+        return f"mỗi {minutes} phút"
+
+    async def _get_auto_crawl_enabled(self) -> bool:
+        if self._auto_crawl_enabled is not None:
+            return self._auto_crawl_enabled
+        raw = await self._repo.get_app_setting(AUTO_CRAWL_SETTING)
+        if raw is None:
+            enabled = self._settings.auto_crawl_enabled
+            await self._repo.set_app_setting(AUTO_CRAWL_SETTING, "1" if enabled else "0")
+        else:
+            enabled = raw.strip().lower() in {"1", "true", "yes", "on"}
+        self._auto_crawl_enabled = enabled
+        return enabled
+
+    async def _set_auto_crawl_enabled(self, enabled: bool) -> None:
+        async with self._auto_lock:
+            await self._repo.set_app_setting(AUTO_CRAWL_SETTING, "1" if enabled else "0")
+            self._auto_crawl_enabled = enabled
+            if enabled:
+                self.start_scheduler()
+            else:
+                self.stop_scheduler()
 
     async def _scheduled_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._get_auto_crawl_enabled():
+            logger.info("Bỏ qua job scheduler vì crawl tự động đang tắt")
+            return
         await self._run_scheduled_crawl("scheduler")
 
     async def _run_scheduled_crawl(self, reason: str) -> None:
@@ -382,8 +453,17 @@ class NewsTelegramBot:
         if not self._is_allowed(update):
             logger.warning("Từ chối lệnh từ user %s", update.effective_user.id if update.effective_user else "?")
             return
+        chat = update.effective_chat
+        if chat is None:
+            logger.warning("Không phản hồi được update không có effective_chat")
+            return
+        message = update.effective_message
         try:
-            await self.notifier.send_text(text)
+            await self.notifier.send_text(
+                text,
+                chat_id=str(chat.id),
+                reply_to=message.message_id if message is not None else None,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Không gửi được phản hồi: %s", exc)
 
@@ -429,13 +509,40 @@ class NewsTelegramBot:
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         stats = await self._repo.get_stats()
+        auto_enabled = await self._get_auto_crawl_enabled()
         summary = {
             "Browser": f"{self._settings.browser_engine.value} (headless={self._settings.browser_headless})",
-            "Lịch crawl": f"mỗi {self._settings.crawl_interval_minutes} phút",
+            "Crawl tự động": f"{'bật' if auto_enabled else 'tắt'} ({self._interval_text()})",
             "Ngưỡng trending": f"{self._settings.trend_min_score:.2f}",
             "Tin tối đa / chủ đề": self._settings.trend_max_per_category,
         }
         await self._reply(update, format_status(stats, summary, utcnow()))
+
+    async def _cmd_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_allowed(update):
+            logger.warning("Từ chối lệnh /auto từ user không được phép")
+            return
+        action = context.args[0].strip().lower() if context.args else "status"
+        if action == "on":
+            await self._set_auto_crawl_enabled(True)
+            await self._reply(
+                update,
+                f"✅ Crawl tự động đã bật ({self._interval_text()}). "
+                "Bot không crawl ngay; dùng /crawl nếu muốn cập nhật bây giờ.",
+            )
+            return
+        if action == "off":
+            await self._set_auto_crawl_enabled(False)
+            await self._reply(update, "⏸ Crawl tự động đã tắt. Lệnh /crawl vẫn hoạt động.")
+            return
+        if action == "status":
+            enabled = await self._get_auto_crawl_enabled()
+            await self._reply(
+                update,
+                f"⚙️ Crawl tự động: {'bật' if enabled else 'tắt'} ({self._interval_text()}).",
+            )
+            return
+        await self._reply(update, "Cú pháp: /auto on, /auto off hoặc /auto status")
 
     async def _cmd_crawl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_allowed(update):

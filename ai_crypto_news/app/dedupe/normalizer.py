@@ -47,11 +47,12 @@ def canonicalize_url(url: str) -> str:
         raw = "https://" + raw.lstrip("/")
 
     parts = urlsplit(raw)
-    scheme = "https" if parts.scheme in ("http", "https", "") else parts.scheme
+    original_scheme = parts.scheme.lower()
+    scheme = "https" if original_scheme in ("http", "https", "") else original_scheme
     host = parts.netloc.lower()
 
     # Bỏ port mặc định
-    if host.endswith(":80") and scheme == "http":
+    if host.endswith(":80") and original_scheme == "http":
         host = host[:-3]
     if host.endswith(":443") and scheme == "https":
         host = host[:-4]
@@ -116,7 +117,6 @@ def strip_html_entities(text: str) -> str:
     """
     text = html.unescape(text)
     text = unicodedata.normalize("NFC", text)
-    return text
     return text
 
 
