@@ -1,0 +1,11 @@
+# playwright bị giới hạn <1.63 bởi camoufox 0.5.6
+playwright==1.62.0
+camoufox==0.5.6
+python-telegram-bot[job-queue]==22.8
+pydantic==2.13.5
+pydantic-settings==2.15.0
+httpx==0.28.1
+aiosqlite==0.22.1
+tzdata==2026.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
